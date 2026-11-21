@@ -163,6 +163,25 @@ def base_month(conn) -> str | None:
     return db.get_meta(conn, "base_month")
 
 
+def _insert_upload(
+    conn, month: str, filename: str, row_count: int, effective_month: str,
+    is_base_month: bool,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO uploads(month, effective_month, filename, row_count, uploaded_at, "
+        "is_base_month) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            month,
+            effective_month,
+            filename or "upload.csv",
+            row_count,
+            calc.now_iso(),
+            1 if is_base_month else 0,
+        ),
+    )
+    return cur.lastrowid
+
+
 def process_upload(conn, raw: bytes, filename: str) -> dict:
     """解析 + 整月替换 + 重算指数，单事务完成。"""
     parsed = parse_csv(raw)
@@ -178,22 +197,21 @@ def process_upload(conn, raw: bytes, filename: str) -> dict:
                 raise UploadError(
                     f"{month} 早于基月 {new_base}，基月之前的报价不接收"
                 )
-        latest = max(filter(None, (month, db.max_uploaded_month(conn))))
+        latest = max(filter(None, (month, db.max_effective_month(conn))))
         if len(db.month_range(new_base, latest)) > MAX_MONTHS:
             raise UploadError(f"基月到最新报价月的跨度不能超过 {MAX_MONTHS} 个月")
 
-        cur = conn.execute(
-            "INSERT INTO uploads(month, filename, row_count, uploaded_at, is_base_month) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                month,
-                filename or "upload.csv",
-                len(parsed.rows),
-                calc.now_iso(),
-                1 if month == new_base else 0,
-            ),
+        if existing_base is None:
+            db.set_meta(conn, "base_month", new_base)
+
+        # 上传文件的月份即生效月；原报月与生效月此时相同。
+        is_base = month == new_base
+        if is_base:
+            conn.execute("UPDATE uploads SET is_base_month = 0")
+        upload_id = _insert_upload(
+            conn, month, filename, len(parsed.rows), month,
+            is_base_month=is_base,
         )
-        upload_id = cur.lastrowid
 
         conn.execute("DELETE FROM prices WHERE month = ?", (month,))
         conn.executemany(
@@ -202,13 +220,10 @@ def process_upload(conn, raw: bytes, filename: str) -> dict:
             [(upload_id, month, r.stall, r.item, r.price) for r in parsed.rows],
         )
 
-        if existing_base is None:
-            db.set_meta(conn, "base_month", new_base)
-
         calc.recompute(
             conn,
             new_base,
-            changed_month=None if existing_base is None else month,
+            changed_months=None if existing_base is None else [month],
             latest_month=latest,
         )
 
@@ -218,4 +233,115 @@ def process_upload(conn, raw: bytes, filename: str) -> dict:
         "upload_id": upload_id,
         "base_month": new_base,
         "replaced": existing_base is not None,
+    }
+
+
+def parse_month_token(token: str) -> tuple[str, int | None]:
+    """解析页面下拉框的值：'YYYY-MM|批次号' 或 'YYYY-MM'。"""
+    token = (token or "").strip()
+    month, _, raw_id = token.partition("|")
+    if not MONTH_RE.match(month):
+        raise UploadError(f"月份「{token}」格式不正确，应为 YYYY-MM")
+    batch_id: int | None = None
+    if raw_id:
+        if not raw_id.isdigit():
+            raise UploadError(f"月份「{token}」的批次号不正确")
+        batch_id = int(raw_id)
+    return month, batch_id
+
+
+def swap_months(
+    conn,
+    month_a: str,
+    month_b: str,
+    expected: dict[str, int | None] | None = None,
+) -> dict:
+    """把两个已报月份的报价整体对调（同一次事务内完成）。
+
+    - 报价、批次的生效月（effective_month）与指数一起变更；原上传记录保留，
+      `uploads.month` 仍是报表最初的月份。
+    - 基月仍是原来的月份（不随批次移动），其报价换成对调后的那一份。
+    - 只重算这两个月及各自下一月的环比，其余环比沿用已有结果。
+    - expected 传入页面所见各月现行批次号；若与当前批次不一致则拒绝。
+    """
+    month_a, _ = parse_month_token(month_a)
+    month_b, _ = parse_month_token(month_b)
+    if month_a == month_b:
+        raise UploadError("请选择两个不同的月份进行对调")
+
+    if not expected:
+        raise UploadError("缺少页面所见的批次信息，请重新查看页面后再对调")
+
+    with db.transaction(conn):
+        base = base_month(conn)
+        if base is None:
+            raise UploadError("还没有基月，无法对调")
+
+        current = db.current_batches(conn)
+        for month in (month_a, month_b):
+            if month not in current:
+                raise UploadError(f"{month} 没有现行批次，无法对调")
+            seen = expected.get(month)
+            if seen is None:
+                raise UploadError(
+                    f"没有收到 {month} 的现行批次号，请重新查看页面后再对调"
+                )
+            if seen != current[month]["id"]:
+                raise UploadError(
+                    f"{month} 的现行批次已变化（页面所见 #{seen}，"
+                    f"当前 #{current[month]['id']}），已停止对调，请重新查看页面"
+                )
+
+        batch_a, batch_b = current[month_a]["id"], current[month_b]["id"]
+        if batch_a == batch_b:  # 同一批次不可能占据两个月，防御性检查
+            raise UploadError("两个月份指向了同一批次，已停止对调")
+
+        # 先把两个月的明细挪到临时月份，避免 UNIQUE(month, stall, item) 冲突
+        tmp_a, tmp_b = "__swap_a__", "__swap_b__"
+        conn.execute(
+            "UPDATE prices SET month = ? WHERE month = ?", (tmp_a, month_a)
+        )
+        conn.execute(
+            "UPDATE prices SET month = ? WHERE month = ?", (tmp_b, month_b)
+        )
+        conn.execute(
+            "UPDATE prices SET month = ? WHERE month = ?", (month_b, tmp_a)
+        )
+        conn.execute(
+            "UPDATE prices SET month = ? WHERE month = ?", (month_a, tmp_b)
+        )
+
+        # 批次归属随报价一起移动到对方月份
+        conn.execute(
+            "UPDATE uploads SET effective_month = ? WHERE id = ?",
+            (month_b, batch_a),
+        )
+        conn.execute(
+            "UPDATE uploads SET effective_month = ? WHERE id = ?",
+            (month_a, batch_b),
+        )
+        # 基月不随报价移动：仍由基月当前使用的那一批次承担
+        conn.execute("UPDATE uploads SET is_base_month = 0")
+        conn.execute(
+            "UPDATE uploads SET is_base_month = 1 WHERE id = ("
+            "  SELECT MAX(id) FROM uploads WHERE effective_month = ?"
+            ")",
+            (base,),
+        )
+        db.set_meta(conn, "base_month", base)
+
+        latest = db.max_effective_month(conn)
+        calc.recompute(
+            conn,
+            base,
+            changed_months=[month_a, month_b],
+            latest_month=latest,
+        )
+
+    return {
+        "month_a": month_a,
+        "month_b": month_b,
+        "batch_a": batch_a,
+        "batch_b": batch_b,
+        "base_month": base,
     }

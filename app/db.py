@@ -2,9 +2,11 @@
 
 设计要点：
 - 报价明细（prices）与指数结果（index_months）分表存放。
-- 每个报价批次（upload）带自增 id；同一月份只保留最新批次的报价，
-  且指数结果表保存了算该结果时所用的报价版本（source_upload_id），
-  因此「查指数」只读结果表，不碰报价明细。
+- 每个报价批次（upload）保留两条月份信息：`month` 是原报月（CSV 里填写、
+  永不改动），`effective_month` 是生效月（这批报价当前计入的月份）。
+  月份对调只改 `effective_month`，原始上传记录因此完整保留。
+- 同一生效月只保留最新批次的报价，且指数结果表保存了算该结果时所用的
+  报价版本（source_upload_id），因此「查指数」只读结果表，不碰报价明细。
 - 任何一次整月替换都在单个事务内完成：先写入新报价、再重算受影响的
   指数、最后才提交。任何一步失败回滚，旧报价与旧结果都保留。
 """
@@ -21,12 +23,13 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS uploads (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    month         TEXT    NOT NULL,          -- 'YYYY-MM'
-    filename      TEXT    NOT NULL,
-    row_count     INTEGER NOT NULL,
-    uploaded_at   TEXT    NOT NULL,          -- UTC ISO8601
-    is_base_month INTEGER NOT NULL DEFAULT 0
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    month           TEXT    NOT NULL,        -- 原报月：CSV 里填写的月份
+    effective_month TEXT    NOT NULL DEFAULT '',  -- 生效月：该批报价当前所属月份
+    filename        TEXT    NOT NULL,
+    row_count       INTEGER NOT NULL,
+    uploaded_at     TEXT    NOT NULL,        -- UTC ISO8601
+    is_base_month   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_uploads_month ON uploads(month, id);
@@ -78,8 +81,29 @@ def init_db(database: str | Path) -> None:
     conn = connect(database)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """把旧库补到当前结构：补齐 uploads.effective_month 并回填。
+
+    旧库里没有「生效月」概念，批次月份就是生效月；回填一次即可。
+    """
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(uploads)")}
+    with transaction(conn):
+        if "effective_month" not in columns:
+            conn.execute(
+                "ALTER TABLE uploads ADD COLUMN effective_month TEXT NOT NULL DEFAULT ''"
+            )
+        conn.execute(
+            "UPDATE uploads SET effective_month = month WHERE effective_month = '' "
+            "OR effective_month IS NULL"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_uploads_effective ON uploads(effective_month, id)"
+    )
 
 
 @contextmanager
@@ -112,9 +136,10 @@ def all_months(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM index_months ORDER BY month").fetchall()
 
 
-def max_uploaded_month(conn: sqlite3.Connection) -> str | None:
-    row = conn.execute("SELECT MAX(month) AS m FROM uploads").fetchone()
-    return row["m"] if row else None
+def max_effective_month(conn: sqlite3.Connection) -> str | None:
+    """当前有报价明细的最大生效月（历史批次不算）。"""
+    months = list(current_batches(conn))
+    return months[-1] if months else None
 
 
 def previous_month(month: str) -> str:
@@ -173,5 +198,33 @@ def upsert_index_rows(
 
 def recent_uploads(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
     return conn.execute(
-        "SELECT * FROM uploads ORDER BY id DESC LIMIT ?", (limit,)
+        "SELECT u.*, "
+        "  (SELECT COUNT(*) FROM prices p WHERE p.upload_id = u.id) AS price_count "
+        "FROM uploads u ORDER BY u.id DESC LIMIT ?",
+        (limit,),
     ).fetchall()
+
+
+def current_batches(conn: sqlite3.Connection) -> dict[str, dict]:
+    """每个生效月当前使用的批次（以实际仍有报价明细的最新上传为准）。
+
+    历史批次（被替换或对调后已无报价）仍保留在 uploads 表里，但不算「现行」。
+    返回 {生效月: 批次字典}，按生效月升序。
+    """
+    rows = conn.execute(
+        "SELECT u.id, u.month, u.effective_month, u.filename, u.row_count, "
+        "       u.uploaded_at, "
+        "       (SELECT COUNT(*) FROM prices p WHERE p.upload_id = u.id) AS price_count "
+        "FROM uploads u ORDER BY u.id"
+    ).fetchall()
+
+    latest: dict[str, dict] = {}
+    for row in rows:
+        data = dict(row)
+        month = data["effective_month"]
+        if not month or data["price_count"] <= 0:
+            continue
+        current = latest.get(month)
+        if current is None or data["id"] > current["id"]:
+            latest[month] = data
+    return {month: latest[month] for month in sorted(latest)}

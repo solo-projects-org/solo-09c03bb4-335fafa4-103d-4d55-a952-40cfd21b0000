@@ -54,11 +54,15 @@ def _price(stall: str, item: str, month: str) -> float | None:
     return round(base * SCALE[month], 2)
 
 
-def build_csv(month: str, layout: str = "normal") -> str:
+def build_csv(
+    month: str, layout: str = "normal", prices: dict[tuple[str, str], float] | None = None
+) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["月份", "摊位", "品种", "每公斤报价"])
-    if layout == "normal":
+    if prices is not None:
+        source = prices
+    elif layout == "normal":
         source = {
             (stall, item): _price(stall, item, month)
             for stall in STALLS
@@ -93,10 +97,7 @@ def _require_demo(conn) -> None:
         raise DemoError("请先点「载入示例数据」")
     if base != MONTHS[0]:
         raise DemoError("当前数据不是示例数据，请先点「载入示例数据」")
-    have = {
-        r["month"]
-        for r in conn.execute("SELECT DISTINCT month FROM uploads").fetchall()
-    }
+    have = set(db.current_batches(conn))
     if "2025-02" not in have or "2025-03" not in have:
         raise DemoError("示例数据不完整，请重新载入")
 
@@ -117,7 +118,7 @@ def run(action: str, conn) -> str:
     _require_demo(conn)
 
     if action == "backfill":
-        if conn.execute("SELECT 1 FROM uploads WHERE month='2025-04'").fetchone():
+        if "2025-04" in db.current_batches(conn):
             raise DemoError("4 月已有报价，无需补报（可先点「载入示例数据」重置）")
         _upload(conn, "2025-04")
         return "已补报 2025-04：4 月环比接通，5 月指数随之恢复。"
@@ -146,6 +147,39 @@ def run(action: str, conn) -> str:
         return (
             "已把 2025-02 中 A-01 摊位报价上调 20%：只重算 2、3 月环比，"
             "2 月及之后各月指数随之更新。"
+        )
+
+    if action == "swap":
+        current = db.current_batches(conn)
+        for month in ("2025-02", "2025-03"):
+            if month not in current:
+                raise DemoError(f"{month} 没有现行批次，请先点「载入示例数据」")
+        result = services.swap_months(
+            conn,
+            "2025-02",
+            "2025-03",
+            expected={
+                "2025-02": current["2025-02"]["id"],
+                "2025-03": current["2025-03"]["id"],
+            },
+        )
+        return (
+            f"已对调 {result['month_a']} 与 {result['month_b']} 的报价："
+            "原始上传记录保留，批次归属与指数一并更新；只重算 2、3、4 月环比。"
+        )
+
+    if action == "resubmit":
+        # 对调后按生效月重报 2025-03：在该月当前报价基础上整体上调 10%，
+        # 走正常上传路径，整体替换该月报价，指数改用新批次。
+        if "2025-03" not in db.current_batches(conn):
+            raise DemoError("2025-03 没有现行批次，请先点「载入示例数据」")
+        current_prices = db.month_prices(conn, "2025-03")
+        source = {key: round(price * 1.10, 2) for key, price in current_prices.items()}
+        raw = build_csv("2025-03", prices=source).encode("utf-8")
+        services.process_upload(conn, raw, "demo-2025-03-resubmitted.csv")
+        return (
+            "已按生效月重报 2025-03（当前报价整体上调 10%）：该月报价替换为新批次，"
+            "指数使用新批次，只重算 3、4 月环比。"
         )
 
     raise DemoError("未知的演示操作")

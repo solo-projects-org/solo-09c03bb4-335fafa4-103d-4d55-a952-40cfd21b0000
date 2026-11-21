@@ -40,12 +40,14 @@ def close_conn(_exc):
 
 def _snapshot() -> dict:
     conn = _conn()
-    rows = calc.read_index(conn)
+    rows, batches = calc.read_snapshot(conn)
     return {
         "rows": rows,
         "base_month": services.base_month(conn),
         "latest_month": rows[-1]["month"] if rows else None,
         "uploads": db.recent_uploads(conn, 12),
+        "current_batch_ids": {b["id"] for b in batches.values()},
+        "batch_list": list(batches.values()),
         "demo_enabled": current_app.config["DEMO_ENABLED"],
     }
 
@@ -91,6 +93,36 @@ def upload():
     flash(
         f"已{verb} {result['month']} 的 {result['rows']} 条报价"
         + ("，该月为基月" if result["month"] == result["base_month"] else ""),
+        "success",
+    )
+    return redirect(url_for("main.home"))
+
+
+@bp.post("/swap")
+def swap():
+    try:
+        month_a, batch_a = services.parse_month_token(request.form.get("month_a", ""))
+        month_b, batch_b = services.parse_month_token(request.form.get("month_b", ""))
+        result = services.swap_months(
+            _conn(),
+            month_a,
+            month_b,
+            expected={month_a: batch_a, month_b: batch_b},
+        )
+    except services.UploadError as exc:
+        log.warning("对调被拒绝：%s", exc.message)
+        flash(exc.message, "error")
+        for detail in exc.details:
+            flash(detail, "detail")
+        return redirect(url_for("main.home"))
+    except Exception:
+        log.exception("对调失败，已回滚")
+        flash("对调失败，已回滚，原有报价和指数保持不变", "error")
+        return redirect(url_for("main.home"))
+
+    flash(
+        f"已对调 {result['month_a']} 与 {result['month_b']} 的报价："
+        "报价、批次归属与指数一并生效；原始上传记录保留。",
         "success",
     )
     return redirect(url_for("main.home"))

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable
 from datetime import datetime, timezone
 
 from . import db
@@ -42,23 +43,23 @@ def pair_factor(
 
 
 def _latest_upload_ids(conn: sqlite3.Connection) -> dict[str, int]:
-    rows = conn.execute(
-        "SELECT month, MAX(id) AS upload_id FROM uploads GROUP BY month"
-    ).fetchall()
-    return {r["month"]: r["upload_id"] for r in rows}
+    """每个生效月当前使用的批次（只算仍有报价明细的批次）。"""
+    return {
+        month: batch["id"] for month, batch in db.current_batches(conn).items()
+    }
 
 
 def recompute(
     conn: sqlite3.Connection,
     base_month: str,
-    changed_month: str | None = None,
+    changed_months: Iterable[str] | None = None,
     latest_month: str | None = None,
 ) -> list[str]:
     """重算并写入 index_months，返回页面展示的月份序列。
 
-    调用方负责事务。changed_month 为空表示全量重算。
+    调用方负责事务。changed_months 为空表示全量重算。
     """
-    latest = latest_month or db.max_uploaded_month(conn)
+    latest = latest_month or db.max_effective_month(conn)
     if latest is None or latest < base_month:
         return []
     months = db.month_range(base_month, latest)
@@ -71,10 +72,13 @@ def recompute(
     upload_ids = _latest_upload_ids(conn)
 
     # 需要重算环比系数的月份
-    if changed_month is None:
+    if changed_months is None:
         factor_months = {m for m in months if m > base_month}
     else:
-        candidates = {changed_month, db.next_month(changed_month)}
+        candidates: set[str] = set()
+        for m in changed_months:
+            candidates.add(m)
+            candidates.add(db.next_month(m))
         factor_months = {m for m in candidates if m in month_set and m > base_month}
 
     factors: dict[str, tuple[int, float | None]] = {}
@@ -145,7 +149,25 @@ def read_index(conn: sqlite3.Connection) -> list[dict]:
         rows = [dict(r) for r in db.all_months(conn)]
     finally:
         conn.execute("COMMIT")
+    return decorate_index_rows(rows)
 
+
+def read_snapshot(conn: sqlite3.Connection) -> tuple[list[dict], dict[str, dict]]:
+    """一次读事务里读出「指数 + 各月现行批次」。
+
+    页面同时展示两者，且提交对调时要按页面上看到的批次号做校验，
+    因此必须来自同一快照，避免读到「指数旧、批次新」的错配。
+    """
+    conn.execute("BEGIN")
+    try:
+        rows = [dict(r) for r in db.all_months(conn)]
+        batches = db.current_batches(conn)
+    finally:
+        conn.execute("COMMIT")
+    return decorate_index_rows(rows), batches
+
+
+def decorate_index_rows(rows: list[dict]) -> list[dict]:
     by_month = {r["month"]: r for r in rows}
     for row in rows:
         row["display_index"] = (

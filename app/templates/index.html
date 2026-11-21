@@ -35,6 +35,55 @@
       </p>
     </section>
 
+    {% if batch_list %}
+    <section class="card">
+      <h2>现行批次</h2>
+      <p class="hint">
+        每个已报月份当前生效的报价批次。「原报月」是上传文件里填写的月份，
+        「生效月」是这批报价当前计入的月份；对调后两者会不同，原始上传记录始终保留。
+      </p>
+      <table class="compact">
+        <thead><tr><th>生效月</th><th>原报月</th><th>批次</th><th>条数</th><th>文件</th><th>上传时间（UTC）</th><th>基月</th></tr></thead>
+        <tbody>
+          {% for b in batch_list %}
+          <tr>
+            <td><strong>{{ b.effective_month }}</strong></td>
+            <td>{{ b.month }}</td>
+            <td class="num">#{{ b.id }}</td>
+            <td class="num">{{ b.row_count }}</td>
+            <td class="filename">{{ b.filename }}</td>
+            <td class="num">{{ b.uploaded_at }}</td>
+            <td>{% if b.effective_month == base_month %}<span class="tag base">基月</span>{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>对调两个月的报价</h2>
+      <form method="post" action="{{ url_for('main.swap') }}">
+        <select name="month_a" required>
+          <option value="">选择月份 A</option>
+          {% for b in batch_list %}
+          <option value="{{ b.effective_month }}|{{ b.id }}">{{ b.effective_month }}（原报 {{ b.month }}，批次 #{{ b.id }}）</option>
+          {% endfor %}
+        </select>
+        <select name="month_b" required>
+          <option value="">选择月份 B</option>
+          {% for b in batch_list %}
+          <option value="{{ b.effective_month }}|{{ b.id }}">{{ b.effective_month }}（原报 {{ b.month }}，批次 #{{ b.id }}）</option>
+          {% endfor %}
+        </select>
+        <button type="submit">对调报价</button>
+      </form>
+      <p class="hint">
+        对调后基月不变，两个月及各自下一月的环比重算，指数随之更新；
+        若提交时任一月份的现行批次与页面所见不一致，将停止对调并提示重新查看。
+      </p>
+    </section>
+    {% endif %}
+
     {% if demo_enabled %}
     <section class="card">
       <h2>演示：换报断链与补报接续</h2>
@@ -44,11 +93,17 @@
         <form method="post" action="{{ url_for('main.run_demo', action='break') }}"><button>换掉 2025-03（制造断链）</button></form>
         <form method="post" action="{{ url_for('main.run_demo', action='repair') }}"><button>恢复 2025-03 原报价</button></form>
         <form method="post" action="{{ url_for('main.run_demo', action='correct') }}"><button>更正 2025-02 的 A-01 报价 +20%</button></form>
+        <form method="post" action="{{ url_for('main.run_demo', action='swap') }}"><button>对调 2025-02 与 2025-03 的报价</button></form>
+        <form method="post" action="{{ url_for('main.run_demo', action='resubmit') }}"><button>对调后重报 2025-03（+10%）</button></form>
         <form method="post" action="{{ url_for('main.run_demo', action='reset') }}"
               onsubmit="return confirm('将删除全部报价与指数（包括手工上传的数据），确定？')">
           <button class="danger">清空全部数据</button>
         </form>
       </div>
+      <p class="hint">
+        「对调 2025-02 与 2025-03」把两月报价互换（基月仍是 2025-01）；
+        「对调后重报 2025-03」模拟日后按生效月重新申报该月，指数改用新批次。
+      </p>
       <p class="hint">「清空全部数据」会删除数据库里的所有报价与指数，谨慎操作。</p>
     </section>
     {% endif %}
@@ -95,15 +150,21 @@
     <section class="card">
       <h2>最近上传</h2>
       <table class="compact">
-        <thead><tr><th>#</th><th>月份</th><th>条数</th><th>文件</th><th>时间（UTC）</th></tr></thead>
+        <thead><tr><th>#</th><th>原报月</th><th>生效月</th><th>条数</th><th>文件</th><th>时间（UTC）</th><th>状态</th></tr></thead>
         <tbody>
           {% for u in uploads %}
           <tr>
             <td>{{ u['id'] }}</td>
             <td>{{ u['month'] }}</td>
+            <td>{{ u['effective_month'] }}</td>
             <td class="num">{{ u['row_count'] }}</td>
             <td class="filename">{{ u['filename'] }}</td>
             <td class="num">{{ u['uploaded_at'] }}</td>
+            <td>
+              {% if u['id'] in current_batch_ids %}<span class="tag ok">现行</span>
+              {% elif u['price_count'] %}<span class="tag missing">已被替换</span>
+              {% else %}<span class="tag">历史</span>{% endif %}
+            </td>
           </tr>
           {% endfor %}
         </tbody>

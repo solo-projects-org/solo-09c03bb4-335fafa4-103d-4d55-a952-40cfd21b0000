@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import create_app, db, services  # noqa: E402
+from app import calc, create_app, db, services  # noqa: E402
 
 
 def csv_bytes(month, rows, header=("月份", "摊位", "品种", "每公斤报价")):
@@ -280,6 +280,317 @@ class TestConsistency(Base):
         self.assertEqual(uploads, 1)
 
 
+class TestSwap(Base):
+    def _seed(self):
+        # 基月 01，2..6 月价格依次 2/3/6/6/6（只有 05/06 环比应保持不变）
+        for month, price in [
+            ("2025-01", 1.0),
+            ("2025-02", 2.0),
+            ("2025-03", 3.0),
+            ("2025-04", 6.0),
+            ("2025-05", 6.0),
+            ("2025-06", 6.0),
+        ]:
+            self.upload(month, [("A", "土豆", price)])
+
+    def swap(self, token_a, token_b, follow=True):
+        return self.client.post(
+            "/swap",
+            data={"month_a": token_a, "month_b": token_b},
+            follow_redirects=follow,
+        )
+
+    def batch_tokens(self):
+        tokens = {}
+        conn = self.conn()
+        try:
+            for month, batch in db.current_batches(conn).items():
+                tokens[month] = f"{month}|{batch['id']}"
+        finally:
+            conn.close()
+        return tokens
+
+    def rows(self):
+        conn = self.conn()
+        try:
+            return {
+                r["month"]: dict(r)
+                for r in conn.execute("SELECT * FROM index_months").fetchall()
+            }
+        finally:
+            conn.close()
+
+    def test_swap_exchanges_prices_and_updates_index(self):
+        self._seed()
+        tokens = self.batch_tokens()
+        resp = self.swap(tokens["2025-02"], tokens["2025-03"])
+        self.assertIn("已对调", resp.get_data(as_text=True))
+
+        t = self.table()
+        # 价格互换：2 月变成原 3 月的 3.0，3 月变成原 2 月的 2.0
+        self.assertAlmostEqual(t["2025-02"]["factor"], 3.0, places=4)
+        self.assertAlmostEqual(t["2025-02"]["index"], 300.0, places=4)
+        self.assertAlmostEqual(t["2025-03"]["factor"], 2.0 / 3.0, places=3)
+        self.assertAlmostEqual(t["2025-03"]["index"], 200.0, places=4)
+
+        conn = self.conn()
+        try:
+            prices = {
+                m: conn.execute(
+                    "SELECT price FROM prices WHERE month=? AND stall='A' AND item='土豆'",
+                    (m,),
+                ).fetchone()["price"]
+                for m in ("2025-02", "2025-03")
+            }
+        finally:
+            conn.close()
+        self.assertEqual(prices, {"2025-02": 3.0, "2025-03": 2.0})
+
+    def test_base_month_stays_put(self):
+        self._seed()
+        tokens = self.batch_tokens()
+        self.swap(tokens["2025-01"], tokens["2025-02"])
+
+        t = self.table()
+        self.assertEqual(t["2025-01"]["status"], "基月")
+        self.assertEqual(t["2025-01"]["index"], 100.0)
+        # 1 月现在拿的是原 2 月报价 2.0，2 月拿的是原 1 月报价 1.0
+        self.assertAlmostEqual(t["2025-02"]["factor"], 1.0 / 2.0, places=4)
+        self.assertAlmostEqual(t["2025-02"]["index"], 50.0, places=4)
+
+        conn = self.conn()
+        try:
+            base = services.base_month(conn)
+            flags = {
+                r["id"]: r["is_base_month"]
+                for r in conn.execute("SELECT id, is_base_month FROM uploads").fetchall()
+            }
+        finally:
+            conn.close()
+        self.assertEqual(base, "2025-01")
+        self.assertEqual(flags[int(tokens["2025-02"].split("|")[1])], 1)
+        self.assertEqual(flags[int(tokens["2025-01"].split("|")[1])], 0)
+
+    def test_original_upload_records_kept_and_effective_month_swapped(self):
+        self._seed()
+        tokens = self.batch_tokens()
+        before = {
+            r["id"]: dict(r)
+            for r in self.conn().execute("SELECT * FROM uploads").fetchall()
+        }
+        self.swap(tokens["2025-02"], tokens["2025-03"])
+
+        conn = self.conn()
+        try:
+            after = {
+                r["id"]: dict(r)
+                for r in conn.execute("SELECT * FROM uploads").fetchall()
+            }
+        finally:
+            conn.close()
+
+        self.assertEqual(before.keys(), after.keys())  # 未新增/删除上传记录
+        id_02 = int(tokens["2025-02"].split("|")[1])
+        id_03 = int(tokens["2025-03"].split("|")[1])
+        # 原报月不变，生效月互换
+        self.assertEqual(after[id_02]["month"], "2025-02")
+        self.assertEqual(after[id_02]["effective_month"], "2025-03")
+        self.assertEqual(after[id_03]["month"], "2025-03")
+        self.assertEqual(after[id_03]["effective_month"], "2025-02")
+        # 其它字段（条数、上传时间、文件名）不变
+        for col in ("row_count", "uploaded_at", "filename"):
+            self.assertEqual(after[id_02][col], before[id_02][col])
+            self.assertEqual(after[id_03][col], before[id_03][col])
+
+    def test_only_two_months_and_neighbours_recomputed(self):
+        self._seed()
+        conn = self.conn()
+        try:
+            with db.transaction(conn):
+                conn.execute(
+                    "UPDATE index_months SET mom_factor = 1.234 WHERE month = '2025-05'"
+                )
+                conn.execute(
+                    "UPDATE index_months SET mom_factor = 1.111 WHERE month = '2025-06'"
+                )
+        finally:
+            conn.close()
+
+        tokens = self.batch_tokens()
+        self.swap(tokens["2025-02"], tokens["2025-03"])
+
+        t = self.table()
+        # 2、3、4 月环比重算
+        self.assertAlmostEqual(t["2025-02"]["factor"], 3.0, places=4)
+        self.assertAlmostEqual(t["2025-03"]["factor"], 2.0 / 3.0, places=3)
+        self.assertAlmostEqual(t["2025-04"]["factor"], 6.0 / 2.0, places=4)
+        # 5、6 月环比沿用已有结果
+        self.assertAlmostEqual(t["2025-05"]["factor"], 1.234, places=4)
+        self.assertAlmostEqual(t["2025-06"]["factor"], 1.111, places=4)
+        # 指数仍从基月重新串联
+        self.assertAlmostEqual(
+            t["2025-06"]["index"], 300.0 * (2 / 3) * 3.0 * 1.234 * 1.111, places=1
+        )
+
+    def test_stale_batch_stops_swap_and_keeps_state(self):
+        self._seed()
+        tokens = self.batch_tokens()
+        # 页面渲染后，2 月被重新上传，现行批次改变
+        self.upload("2025-02", [("A", "土豆", 9.0)])
+        before = self.table()
+
+        resp = self.swap(tokens["2025-02"], tokens["2025-03"])
+        text = resp.get_data(as_text=True)
+        self.assertIn("已停止对调", text)
+        self.assertIn("重新查看", text)
+        self.assertEqual(self.table(), before)
+
+        conn = self.conn()
+        try:
+            price = conn.execute(
+                "SELECT price FROM prices WHERE month='2025-02'"
+            ).fetchone()["price"]
+        finally:
+            conn.close()
+        self.assertEqual(price, 9.0)
+
+    def test_swap_same_month_or_missing_month_rejected(self):
+        self._seed()
+        tokens = self.batch_tokens()
+        resp = self.swap(tokens["2025-02"], tokens["2025-02"])
+        self.assertIn("两个不同的月份", resp.get_data(as_text=True))
+        resp = self.swap(f"2024-12|99", tokens["2025-02"])
+        self.assertIn("没有现行批次", resp.get_data(as_text=True))
+
+    def test_swap_rolls_back_on_write_failure(self):
+        self._seed()
+        tokens = self.batch_tokens()
+        before = self.table()
+        conn = self.conn()
+        try:
+            conn.execute(
+                "CREATE TRIGGER boom BEFORE UPDATE ON uploads "
+                "BEGIN SELECT RAISE(ABORT, 'boom'); END"
+            )
+        finally:
+            conn.close()
+
+        resp = self.swap(tokens["2025-02"], tokens["2025-03"])
+        self.assertIn("已回滚", resp.get_data(as_text=True))
+        self.assertEqual(self.table(), before)
+
+        conn = self.conn()
+        try:
+            price = conn.execute(
+                "SELECT price FROM prices WHERE month='2025-02'"
+            ).fetchone()["price"]
+        finally:
+            conn.close()
+        self.assertEqual(price, 2.0)
+
+    def test_reupload_after_swap_uses_effective_month_and_new_batch(self):
+        self._seed()
+        tokens = self.batch_tokens()
+        id_02 = int(tokens["2025-02"].split("|")[1])  # 对调后归属 2025-03 的批次
+        self.swap(tokens["2025-02"], tokens["2025-03"])
+
+        # 日后重报 2025-03：按生效月整体替换，指数使用新批次
+        self.upload("2025-03", [("A", "土豆", 5.0)])
+
+        conn = self.conn()
+        try:
+            batch = db.current_batches(conn)["2025-03"]
+            old = conn.execute(
+                "SELECT effective_month, (SELECT COUNT(*) FROM prices p "
+                "WHERE p.upload_id = uploads.id) AS n FROM uploads WHERE id = ?",
+                (id_02,),
+            ).fetchone()
+            idx = conn.execute(
+                "SELECT pair_count, mom_factor, index_value, source_upload_id "
+                "FROM index_months WHERE month='2025-03'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertNotEqual(batch["id"], id_02)
+        self.assertEqual(batch["month"], "2025-03")  # 原报月 = 生效月
+        self.assertEqual(old["n"], 0)  # 旧批次明细被替换，但记录仍在
+        self.assertEqual(old["effective_month"], "2025-03")  # 旧批次仍归属 2025-03
+        self.assertEqual(idx["source_upload_id"], batch["id"])
+        self.assertEqual(idx["pair_count"], 1)
+        self.assertAlmostEqual(idx["mom_factor"], 5.0 / 3.0, places=6)
+
+    def test_reupload_base_month_keeps_single_base_batch(self):
+        self._seed()
+        self.upload("2025-01", [("A", "土豆", 2.0)])
+        conn = self.conn()
+        try:
+            flags = [
+                r["is_base_month"]
+                for r in conn.execute(
+                    "SELECT is_base_month FROM uploads WHERE effective_month='2025-01'"
+                ).fetchall()
+            ]
+            base = services.base_month(conn)
+        finally:
+            conn.close()
+        self.assertEqual(sum(flags), 1)
+        self.assertEqual(base, "2025-01")
+        t = self.table()
+        self.assertEqual(t["2025-01"]["status"], "基月")
+        self.assertEqual(t["2025-01"]["index"], 100.0)
+        self.assertAlmostEqual(t["2025-02"]["factor"], 2.0 / 2.0, places=4)
+
+    def test_non_adjacent_swap_preserves_months_between(self):
+        self._seed()
+        conn = self.conn()
+        try:
+            with db.transaction(conn):
+                conn.execute(
+                    "UPDATE index_months SET mom_factor = 1.777 WHERE month = '2025-04'"
+                )
+        finally:
+            conn.close()
+
+        tokens = self.batch_tokens()
+        self.swap(tokens["2025-02"], tokens["2025-05"])
+
+        t = self.table()
+        # 2 月换成原 5 月价 6.0；5 月换成原 2 月价 2.0
+        self.assertAlmostEqual(t["2025-02"]["factor"], 6.0, places=4)
+        self.assertAlmostEqual(t["2025-03"]["factor"], 3.0 / 6.0, places=4)
+        self.assertAlmostEqual(t["2025-05"]["factor"], 2.0 / 6.0, places=4)
+        self.assertAlmostEqual(t["2025-06"]["factor"], 6.0 / 2.0, places=4)
+        # 3→4、4 月的环比不在对调影响范围内，沿用旧值
+        self.assertAlmostEqual(t["2025-04"]["factor"], 1.777, places=4)
+
+    def test_snapshot_reads_index_and_batches_together(self):
+        self._seed()
+        conn = self.conn()
+        try:
+            rows, batches = calc.read_snapshot(conn)
+        finally:
+            conn.close()
+        self.assertEqual(rows[-1]["month"], batches[list(batches)[-1]]["effective_month"])
+        self.assertTrue(all(r["status"] for r in rows))
+
+    def test_page_shows_original_and_effective_months(self):
+        self._seed()
+        tokens = self.batch_tokens()
+        html = self.client.get("/").get_data(as_text=True)
+        self.assertIn("原报月", html)
+        self.assertIn("生效月", html)
+        self.assertIn("对调两个月的报价", html)
+        self.assertIn(tokens["2025-02"], html)
+        self.assertIn(tokens["2025-03"], html)
+
+        self.swap(tokens["2025-02"], tokens["2025-03"])
+        html = self.client.get("/").get_data(as_text=True)
+        # 对调后两批的原报月不变、生效月互换，页面可核对
+        self.assertIn("2025-02|" + tokens["2025-03"].split("|")[1], html)
+        self.assertIn("2025-03|" + tokens["2025-02"].split("|")[1], html)
+
+
 class TestDemo(Base):
     def test_demo_break_and_backfill(self):
         self.client.post("/demo/load", follow_redirects=True)
@@ -306,6 +617,48 @@ class TestDemo(Base):
         self.assertEqual(before["2025-01"], after["2025-01"])
         self.assertNotEqual(before["2025-02"]["factor"], after["2025-02"]["factor"])
         self.assertNotEqual(before["2025-05"]["index"], after["2025-05"]["index"])
+
+    def test_demo_swap_then_resubmit(self):
+        self.client.post("/demo/load", follow_redirects=True)
+        self.client.post("/demo/backfill", follow_redirects=True)
+        before = self.table()
+        self.client.post("/demo/swap", follow_redirects=True)
+        swapped = self.table()
+        # 2、3 月报价互换：2 月变成「3 月价 / 1 月价」，3 月变成「2 月价 / 3 月价」，
+        # 4 月分母换成 2 月价；5 月环比（4 月价 / 5 月价）不受影响
+        self.assertAlmostEqual(
+            swapped["2025-02"]["factor"],
+            before["2025-02"]["factor"] * before["2025-03"]["factor"],
+            places=3,
+        )
+        self.assertAlmostEqual(
+            swapped["2025-03"]["factor"], 1 / before["2025-03"]["factor"], places=3
+        )
+        self.assertAlmostEqual(swapped["2025-05"]["factor"], before["2025-05"]["factor"], places=4)
+        self.assertEqual(swapped["2025-01"]["status"], "基月")
+
+        conn = self.conn()
+        try:
+            batches = {m: b["month"] for m, b in db.current_batches(conn).items()}
+            count_before = conn.execute("SELECT COUNT(*) c FROM uploads").fetchone()["c"]
+        finally:
+            conn.close()
+        self.assertEqual(batches["2025-02"], "2025-03")
+        self.assertEqual(batches["2025-03"], "2025-02")
+
+        self.client.post("/demo/resubmit", follow_redirects=True)
+        conn = self.conn()
+        try:
+            count_after = conn.execute("SELECT COUNT(*) c FROM uploads").fetchone()["c"]
+            batch = db.current_batches(conn)["2025-03"]
+            idx = conn.execute(
+                "SELECT source_upload_id FROM index_months WHERE month='2025-03'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(count_after, count_before + 1)
+        self.assertEqual(batch["month"], "2025-03")
+        self.assertEqual(idx["source_upload_id"], batch["id"])
 
 
 class TestConcurrency(Base):
